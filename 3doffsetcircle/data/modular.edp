@@ -1,0 +1,269 @@
+/*
+*********************************************************************
+Stokes with lag grad-div
+---------------------------------------------------------------------------------------
+********************************************************************
+*/
+//3d offsetcircle
+// upper/lower =0, side sphere = 0
+//On a reduced sparsity stabilization of grad–div type for incompressible flow problems
+include "ffmatlib.idp"
+load "msh3"
+load "medit"
+load "tetgen"
+//include "ffmatlib.idp"
+//--------------------------------------------------------------------
+//Builds a mesh on 3d cylinder with a hole.
+real cx1 = 0.0;
+real cy1 = 0.0;
+real r1 = 1.0;
+real cx2 = 0.5;
+real cy2 = 0.0;
+real r2 = 0.1;
+real zmin=0,zmax=1;
+int[int] rup=[0,1],  rdown=[0,2], rmid=[1,50 ,2,100];
+border C1(t1=0,2*pi){x=cx1+r1*cos(t1);y=cy1+r1*sin(t1);label = 1;};
+border C2(t1=0,2*pi){x=cx2+r2*cos(t1);y=cy2+r2*sin(t1);label = 2;};
+
+int m=8;
+mesh Thcercle = buildmesh(C1(4*m)+C2(-2*m));
+//plot(Thcercle,wait =1);
+
+mesh3 ThF=buildlayers(Thcercle,
+	m,
+	zbound=[zmin,zmax],
+	labelmid=rmid,
+	labelup = rup,
+  labeldown = rdown);// sidewall
+// plot(ThF,wait =1);
+//Find boundary label
+  // int[int] lab = labels(ThF);
+  // cout<<lab<<endl;
+  // varf onG(u, v) = on(lab, u = label);
+  // fespace Vh1(ThF, P1);
+  // Vh1 u;
+  // u[] = onG(0, Vh);
+  // plot(u,value = true);
+mesh3 Th1 = trunc(ThF,(x>=0));
+ //********************************************************************
+ //Define common expressions via macros:
+ macro div(u1,u2,u3) ( dx(u1) + dy(u2) +dz(u3) ) //
+ macro dot(u1,u2,u3,v1,v2,v3) ( (u1) * (v1) + (u2) * (v2) + (u3) * (v3) ) //
+ macro Ugradv1(u1,u2,u3,v1) ( (u1) * dx(v1) + (u2) * dy(v1)  + (u3) * dz(v1)) //
+ macro trilinear(u1,u2,u3, v1,v2,v3, w1,w2,w3) ( dot(Ugradv1(u1,u2,u3,v1),Ugradv1(u1,u2,u3,v2),Ugradv1(u1,u2,u3,v3),w1,w2,w3) ) //
+ macro b(u1,u2,u3, v1,v2,v3, w1,w2,w3) ( 0.5 * ( trilinear(u1,u2,u3, v1,v2,v3, w1,w2,w3) - trilinear(u1,u2,u3, v1,v2,v3, w1,w2,w3) ) ) //
+ macro bb(u1,u2,u3, v1,v2,v3, w1,w2,w3) ( trilinear(u1,u2,u3, v1,v2,v3, w1,w2,w3) + 0.5 * div(u1,u2,u3) * dot(v1,v2,v3,w1,w2,w3) ) //
+ macro contract(u1,u2,u3,v1,v2,v3) ( dx(u1) * dx(v1) + dx(u2) * dx(v2) + dx(u3)* dx(v3)+ dy(u1) * dy(v1) + dy(u2) * dy(v2) +dy(u3)*dy(v3)+dz(u1) * dz(v1) + dz(u2) * dz(v2) +dz(u3)*dz(v3) ) //
+ macro lag(u1,u2,u3,v1,v2,v3) (dx(u1)* dx(v1)+dy(u2)*dy(v2)+dz(u3)*dz(v3))//
+ //********************************************************************
+ //CONSTRUCT FE-Spaces
+
+ 	fespace Xh(ThF,P2); //Velocity space, C0 – piecewise quadratic
+ 	fespace Qh(ThF,P1); //Pressure space, C0- piecewise linear
+
+	Xh uX,uY,uZ,uuX,uuY,uuZ,uuXold,uuYold,uuZold,uuXolder,uuYolder,uuZolder; //fe-functions (velocity space)
+	Xh vX,vY,vZ,EX,EY,EZ; //fe-functions (velocity space, test functions)
+	Xh h = hTriangle; //minimum side length in mesh
+
+	Qh p; //fe-functions (pressure space)
+	Qh q; //fe-functions (pressure space, test functions)
+
+  fespace Kh(ThF,[P2,P2,P2]);
+  Kh [h1,h2,h3]=[uX,uY,uZ];
+  real[int] sol2(Kh.ndof);
+
+ //external force f
+ func fx=-4*y*(1-x^2-y^2);
+ func fy=4*x*(1-x^2-y^2);
+ func fz=0;
+ //Smooth bridge (to allow force to increase slowly)
+ func real bridge(real t1){
+   if(t1>1+1e-14)
+         {return 1.0;}
+   if(abs(1-t1)>1e-14)
+         {return exp(-exp(-1./(1-t1)^2)/t1^2);}
+   else
+         {return 1.0;}
+ }
+
+ //parameter setting
+
+
+ real nu = 1e-4;
+ real dtmin = 0.000001;
+ real dt = 0.05;
+ real tinitial = 0;
+ real tfinal = 10;
+ real time = 0.0;
+ int numSteps = (tfinal - tinitial)/dtmin + 1;
+ real[int] t(numSteps+1);
+ real tt = tinitial;
+
+ real PRESSUREPENALTY = 1.0e-6;
+ real gamma = 10;
+ real alpha = 0.48*gamma;
+
+ //********************************************************************
+ //Problem setup
+ problem STEPone([uX,uY,uZ,p],[vX,vY,vZ,q],solver=UMFPACK)=
+   int3d(ThF)(
+     (1/dt)*dot(uX,uY,uZ,vX,vY,vZ)
+ 	 	+ nu * contract(uX, uY,uZ, vX, vY,vZ)
+ 	+ b(uuXold,uuYold,uuZold,uX,uY,uZ,vX,vY,vZ)
+     - p * div(vX, vY,vZ)
+     - PRESSUREPENALTY * p* q
+     - q * div(uX, uY,uZ)
+  )
+
+  +int3d(ThF)(
+ 	 -(1/dt)*dot(uuXold,uuYold,uuZold,vX,vY,vZ)
+ 	-dot(fx,fy,fz,vX,vY,vZ)*bridge(tt)
+    )
+ + on(1,2,50,100, uX = 0, uY = 0,uZ=0);
+ //********************************************************************
+ //Step2 for G*
+ varf aa1([uuX,uuY,uuZ],[vX,vY,vZ])
+   = int3d(ThF)((1.0/dt)*dot(uuX,uuY,uuZ,vX,vY,vZ)
+           + (alpha+gamma)*lag(uuX,uuY,uuZ,vX,vY,vZ)
+           );
+ varf bb1([uuX,uuY,uuZ],[vX,vY,vZ])
+   =int3d(ThF)((1.0/dt)*dot(uX,uY,uZ,vX,vY,vZ)
+         + (alpha+gamma)*lag(uuXold,uuYold,uuZold,vX,vY,vZ)
+         - gamma * div(uuXold,uuYold,uuZold)*div(vX,vY,vZ)
+           );
+ //********************************************************************
+ //Problem setup with lag grad div
+ problem STEPonewithlag([uX,uY,uZ,p],[vX,vY,vZ,q],solver=UMFPACK)=
+   int3d(ThF)(
+     (1/dt)*dot(uX,uY,uZ,vX,vY,vZ)
+ 	+nu * contract(uX, uY,uZ, vX, vY,vZ)
+ 	+ b(uuXold,uuYold,uuZold,uX,uY,uZ,vX,vY,vZ)
+     - p * div(vX, vY,vZ)
+     - PRESSUREPENALTY * p* q
+     - q * div(uX, uY,uZ)
+   + (alpha+gamma)*lag(uX,uY,uZ,vX,vY,vZ)
+  )
+
+  +int3d(ThF)(
+ 	- (1/dt)*dot(uuXold,uuYold,uuZold,vX,vY,vZ)
+   - (alpha+gamma)*lag(uuXold,uuYold,uuZold,vX,vY,vZ)
+   + gamma*div(uuXold,uuYold,uuZold)*div(vX,vY,vZ)
+ 	- dot(fx,fy,fz,vX,vY,vZ)*bridge(tt)
+    )
+ + on(1,2,50,100, uX = 0, uY = 0,uZ=0);
+ //********************************************************************
+
+ //********************************************************************
+ //*********** Main SOLVE (evolutionary)
+ //********************************************************************
+ Xh[int] UX(numSteps),UY(numSteps),UZ(numSteps),UUX(numSteps),UUY(numSteps),UUZ(numSteps),L2errorU(numSteps);
+ Qh[int] P(numSteps),NMP(numSteps),L2errorP(numSteps);
+ real[int] L2U(numSteps),L2L2U(numSteps),L2DIVU(numSteps),L2L2DIVU(numSteps),L2GRADU(numSteps),L2L2GRADU(numSteps),L2P(numSteps),L2L2P(numSteps);
+ Xh[int] speed(numSteps);
+ plot(ThF);
+ ofstream fileu("modularoffsetcirclelagugamma="+gamma+"alpha="+alpha);
+ ofstream filedivu("modularoffsetcirclelagdivugamma="+gamma+"alpha="+alpha);
+ ofstream filep("modularoffsetcirclelagpgamma="+gamma+"alpha="+alpha);
+ cout.precision(3);
+ cout << endl;
+ cout << "NbBoundaryElements:\t" <<  ThF.nbe << endl;
+ cout << "NbTriangles:\t\t" <<  ThF.nt << endl;
+ cout << "NbVertices:\t\t" <<  ThF.nv << endl;
+ cout << "nDoF:\t\t\t" << Xh.ndof << endl;
+  cout << "nDoF:\t\t\t" << Qh.ndof << endl;
+ cout << endl;
+
+ time = clock();
+ int k = 0;
+ t[0] = tinitial;  //Initialize time.
+ tt = t[0];
+
+ UX[0] = 0;
+ UY[0] = 0;
+ UZ[0] = 0;
+ P[0] = 0;
+
+ L2U[0] = 0;
+ L2DIVU[0]=0;
+ L2P[0] = 0;
+ fileu<<L2U[0]<<endl;
+ filedivu<< L2DIVU[0]<<endl;
+ filep<<L2P[0]<<endl;
+ cout << "Velocity error = " << L2U[k] << endl;
+ cout << "LINF DIV error = " << L2DIVU[k] << endl;
+ cout << "Pressure error = " << L2P[k] << endl;
+ speed[0] = sqrt(UX[0]^2+UY[0]^2+UZ[0]^2);
+ plot(speed[0],fill=1,wait=0,value=true,nbiso=20,nbarrow=20,cmm="t= "+tt);
+ //plot([UX[0],UY[0],UZ[0]],fill=1, wait =1);
+ //medit("u"+tt, ThF, [UX[0],UY[0],UZ[0]]);
+ time = clock();
+ k = 1;
+ /////////////////
+
+  matrix A1=aa1(Kh,Kh);
+
+ while (dt >= dtmin)
+ {
+ t[k] = t[k-1] + dt;  //Update time.
+ tt = t[k];
+
+ if (t[k] > tfinal + 1e-12) break;
+ 	// cout << endl << "NUMERICAL TIME LEVEL  t = " << t[k] << endl;
+ 	// cout << endl << " *** real time    = " << clock() << endl;
+ 	// cout << endl << " *** elapsed time = " << clock() - time << endl;
+ 	// cout << endl << " *** iteration = " << k << " and timestep dt = " << dt << endl;
+
+ uuXold = UX[k-1];
+ uuYold = UY[k-1];
+ uuZold = UZ[k-1];
+
+ // STEPonewithlag;
+ // UX[k] = uX;
+ // UY[k] = uY;
+ // UZ[k] = uZ;
+ // P[k] =p;
+
+ STEPone;
+ UUX[k] = uX;
+ UUY[k] = uY;
+ UUZ[k] = uZ;
+ P[k] = p;
+ real[int] b1 = bb1(0,Kh);
+ sol2=A1^-1*b1;
+ h1[]=sol2;UX[k]=h1;UY[k]=h2; UZ[k] =h3;
+
+ //**********
+ L2U[k] = sqrt(int3d(ThF)((UX[k])^2 + (UY[k])^2+(UZ[k])^2));
+ L2DIVU[k] = sqrt(int3d(ThF)((dx(UX[k]) + dy(UY[k])+dz(UZ[k]))^2));
+ L2P[k] = sqrt(int3d(ThF)(P[k]^2));
+ fileu<<L2U[k]<<endl;
+ filedivu<< L2DIVU[k]<<endl;
+ filep<<L2P[k]<<endl;
+
+ // L2Uhat[k] = sqrt(int2d(ThF)((UUX[k]-utrue)^2 + (UUY[k]-vtrue)^2));
+ // L2DIVUhat[k] = sqrt(int2d(ThF)((dx(utrue)-dx(UUX[k]) + dy(vtrue)-dy(UUY[k]))^2));
+ // L2GRADUhat[k] = sqrt(int2d(ThF)((dx(utrue)-dx(UUX[k]))^2 + (dy(utrue)-dy(UUX[k]))^2 + (dx(vtrue)-dx(UUY[k]))^2 + (dy(utrue)-dy(UUY[k]))^2));
+ cout<< "t = "<< tt <<endl;
+ cout << "Velocity error = " << L2U[k] << endl;
+ cout << "LINF DIV error = " << L2DIVU[k] << endl;
+ cout << "Pressure error = " << L2P[k] << endl;
+
+ speed[k] = sqrt(UX[k]^2+UY[k]^2+UZ[k]^2);
+ plot(speed[k],fill=1,wait=0,value=true,nbiso=20,nbarrow=20,cmm="t= "+t[k]);
+ if (k*dt==1 || k*dt==5|| k*dt==10 ){
+        EX = -dx(uX);
+        EY = -dy(uY);
+        EZ = -dz(uZ);
+ 				plot(speed[k],fill=1,wait=0,value=true,nbiso=20,nbarrow=20,cmm="t= "+t[k]+",gamma="+gamma+",alpha="+alpha,ps="modulart="+t[k]+"gamma="+gamma+"alpha= "+alpha+".eps");
+        savemesh(ThF,"modularcap3d"+t[k]+"gamma="+gamma+"alpha= "+alpha+".mesh");
+        ffSaveVh(ThF,Xh,"modularcap3vh"+t[k]+"gamma="+gamma+"alpha= "+alpha+".txt");
+        ffSaveData(speed[k],"modularcap3dspeed"+t[k]+"gamma="+gamma+"alpha= "+alpha+".txt");
+        ffSaveData3(uX,uY,uZ,"modularcap3dpot"+t[k]+"gamma="+gamma+"alpha= "+alpha+".txt");
+        ffSaveData3(EX,EY,EZ,"modularcap3dvec"+t[k]+"gamma="+gamma+"alpha= "+alpha+".txt");
+        //medit("u",ThF,[uX,uY,uZ],order=1,wait=1);
+			}
+ //plot([UX[k],UY[k],UZ[k]], fill=1,wait =1);
+ //medit("u"+tt, ThF, [UX[k],UY[k],UZ[k]]);
+ //**********
+ k = k + 1; //Update iterate;
+ }
