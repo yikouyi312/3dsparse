@@ -5,7 +5,6 @@ addpath('data');
 dt= 0.05;
 tfinal = 10;
 tinitial = 0;
-%para = [0,0;1,1;1,0.758;1,0.6;1,0.5;1,0.4;1,0.3;1,0];
 para = [0.1,0.05;1,0.5;10,5;20,10;50,25;100,50];
 average = zeros(1, size(para,1));
 gammaset = zeros(1, size(para,1));
